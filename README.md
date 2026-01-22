@@ -1,6 +1,4 @@
-NetSpec - WiFi Security Testing Tool
-
-A WiFi penetration testing tool for security professionals to test network security in controlled environments.
+NetSpec - WiFi Tool
 
 Features:
 WiFi Network Scanner: Automatically detects nearby WiFi networks with signal strength indicators
